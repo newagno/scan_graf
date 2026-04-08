@@ -8,6 +8,8 @@ import time
 import threading
 import http.server
 import socketserver
+import signal
+import uuid
 from datetime import datetime
 from telebot.apihelper import ApiTelegramException
 import html
@@ -171,6 +173,21 @@ def process_tfs_step(message):
     except: pass
     send_menu(chat_id)
 
+# --- INSTANCE TRACKING ---
+INSTANCE_ID = str(uuid.uuid4())[:8]
+
+# --- SHUTDOWN HANDLING (RENDER-READY) ---
+def handle_exit(sig, frame):
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [{INSTANCE_ID}] Received SHUTDOWN signal ({sig}). Exiting...")
+    try:
+        bot.stop_polling()
+    except:
+        pass
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_exit)
+signal.signal(signal.SIGINT, handle_exit)
+
 # --- HEALTH CHECK (RENDER-READY) ---
 # Render Web Service requires binding to a port.
 # If you use a 'Background Worker', this part isn't strictly needed but won't hurt.
@@ -197,13 +214,12 @@ def run_bot():
     while True:
         try:
             me = bot.get_me()
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Бот @{me.username} запускає polling...")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] [{INSTANCE_ID}] Бот @{me.username} запускає polling...")
             # Using bot.polling(non_stop=False) so we control the retry loop here
-            # infinity_polling has internal logic that can bypass our 409 handler.
             bot.polling(non_stop=False, timeout=30, long_polling_timeout=15)
         except ApiTelegramException as e:
             if e.error_code == 409:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Помилка 409 (Conflict). Рендер перекриває інстанси.")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] [{INSTANCE_ID}] Помилка 409 (Conflict).")
                 print("Чекаю 60 секунд, поки старий інстанс відключиться...")
                 time.sleep(60)
             else:
@@ -218,9 +234,8 @@ if __name__ == "__main__":
         # Start the health check server in a background thread
         threading.Thread(target=start_health_check, daemon=True).start()
         
-        print("\n--- Бот ЗАПУЩЕНИЙ (Python 3.12) ---")
+        print(f"\n--- Бот ЗАПУЩЕНИЙ (ID: {INSTANCE_ID}) (Python 3.12) ---")
         print("Натисни Ctrl+C для зупинки.")
         run_bot()
     except KeyboardInterrupt:
-        print("\nЗупинка бота...")
-        sys.exit(0)
+        handle_exit(signal.SIGINT, None)
