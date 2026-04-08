@@ -3,7 +3,11 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import os
 import sys
 import logging
+import os
 import time
+import threading
+import http.server
+import socketserver
 from datetime import datetime
 from telebot.apihelper import ApiTelegramException
 import html
@@ -167,18 +171,41 @@ def process_tfs_step(message):
     except: pass
     send_menu(chat_id)
 
+# --- HEALTH CHECK (RENDER-READY) ---
+# Render Web Service requires binding to a port.
+# If you use a 'Background Worker', this part isn't strictly needed but won't hurt.
+def start_health_check():
+    try:
+        port = int(os.environ.get("PORT", 8080))
+        # Simple handler to just return 200 OK for Render's health check
+        class HealthHandler(http.server.SimpleHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+            def log_message(self, format, *args):
+                return # Silence logging for health checks
+
+        with socketserver.TCPServer(("", port), HealthHandler) as httpd:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Health check server started: PORT {port}")
+            httpd.serve_forever()
+    except Exception as e:
+        print(f"Health Check Server Error: {e}")
+
 # --- РЕЖИМ ВІДНОВЛЕННЯ (RENDER-READY) ---
 def run_bot():
     while True:
         try:
             me = bot.get_me()
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Бот @{me.username} запускає polling...")
-            bot.infinity_polling(timeout=30, long_polling_timeout=15)
+            # Using bot.polling(non_stop=False) so we control the retry loop here
+            # infinity_polling has internal logic that can bypass our 409 handler.
+            bot.polling(non_stop=False, timeout=30, long_polling_timeout=15)
         except ApiTelegramException as e:
             if e.error_code == 409:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Помилка 409 (Conflict). Рендер перекриває інстанси.")
-                print("Чекаю 30 секунд, поки старий інстанс відключиться...")
-                time.sleep(30)
+                print("Чекаю 60 секунд, поки старий інстанс відключиться...")
+                time.sleep(60)
             else:
                 print(f"API Error: {e}")
                 time.sleep(10)
@@ -188,6 +215,9 @@ def run_bot():
 
 if __name__ == "__main__":
     try:
+        # Start the health check server in a background thread
+        threading.Thread(target=start_health_check, daemon=True).start()
+        
         print("\n--- Бот ЗАПУЩЕНИЙ (Python 3.12) ---")
         print("Натисни Ctrl+C для зупинки.")
         run_bot()
