@@ -1,9 +1,11 @@
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import os
-import datetime
-import logging
 import sys
+import logging
+import time
+from datetime import datetime
+from telebot.apihelper import ApiTelegramException
 import html
 
 # Configure logging to console and a file for debugging
@@ -165,36 +167,30 @@ def process_tfs_step(message):
     except: pass
     send_menu(chat_id)
 
-if __name__ == "__main__":
-    # Simple check for multiple instances
-    lock_file = "bot.lock"
-    
-    if os.path.exists(lock_file):
+# --- РЕЖИМ ВІДНОВЛЕННЯ (RENDER-READY) ---
+def run_bot():
+    while True:
         try:
-            # Try to test if file is reachable/deletable. 
-            # If another process has it open in 'w' mode on Windows, this often errors.
-            os.remove(lock_file)
-        except Exception:
-            print("\n!!! ПОМИЛКА: Схоже, інший примірник бота вже запущено !!!")
-            print("Перевір вікна терміналу та зупини всі інші процеси 'python tg_bot.py'.")
-            sys.exit(1)
+            me = bot.get_me()
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Бот @{me.username} запускає polling...")
+            bot.infinity_polling(timeout=30, long_polling_timeout=15)
+        except ApiTelegramException as e:
+            if e.error_code == 409:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Помилка 409 (Conflict). Рендер перекриває інстанси.")
+                print("Чекаю 30 секунд, поки старий інстанс відключиться...")
+                time.sleep(30)
+            else:
+                print(f"API Error: {e}")
+                time.sleep(10)
+        except Exception as e:
+            print(f"Unexpected Error: {e}")
+            time.sleep(15)
 
-    # We open and KEEP the file open to help Windows prevent deletion by other instances
-    f_lock = open(lock_file, "w")
-    f_lock.write(str(os.getpid()))
-    f_lock.flush()
-
+if __name__ == "__main__":
     try:
-        me = bot.get_me()
-        logger.info(f"--- STARTING BOT: @{me.username} ---")
-        print(f"\n--- Бот ЗАПУЩЕНИЙ: @{me.username} (Python 3.12) ---")
-        print("Якщо /scan не працює, перевір файл bot_run.log")
-        bot.infinity_polling(timeout=20, long_polling_timeout=20)
-    except Exception as e:
-        logger.exception("CRITICAL: Bot polling failed")
-        print(f"!!! CRITICAL ERROR: {e}")
-    finally:
-        logger.info("--- BOT STOPPED ---")
-        f_lock.close()
-        try: os.remove(lock_file)
-        except: pass
+        print("\n--- Бот ЗАПУЩЕНИЙ (Python 3.12) ---")
+        print("Натисни Ctrl+C для зупинки.")
+        run_bot()
+    except KeyboardInterrupt:
+        print("\nЗупинка бота...")
+        sys.exit(0)
