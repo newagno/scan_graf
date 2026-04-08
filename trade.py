@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-# crypto_scanner_v14_ultimate.py
-# SMC Full Toolkit | Multi-exchange | OOP | ThreadPool | Sessions | Fibs | Trade State
+# crypto_scanner_v15_async.py
+# SMC Full Toolkit | Asyncio | Vectorized Pandas | Strict Error Handling
 
+import ccxt.async_support as ccxt_async
 import ccxt
 import pandas as pd
 import numpy as np
@@ -9,10 +10,8 @@ from datetime import datetime, timezone
 import pandas_ta as ta
 import subprocess
 import sys
-import concurrent.futures
-import time
+import asyncio
 
-# Try to import pyperclip, otherwise fallback to subprocess.clip (Windows) or None
 try:
     import pyperclip
     HAS_PYPERCLIP = True
@@ -21,12 +20,12 @@ except ImportError:
 
 class CryptoScanner:
     EXCHANGES = {
-        '1': ('binance', ccxt.binance, {'options': {'defaultType': 'future'}}),
-        '2': ('binanceusdm', ccxt.binanceusdm, {}),
-        '3': ('okx', ccxt.okx, {'options': {'defaultType': 'swap'}}),
-        '4': ('bybit', ccxt.bybit, {'options': {'defaultType': 'linear'}}),
-        '5': ('bitget', ccxt.bitget, {'options': {'defaultType': 'swap'}}),
-        '6': ('whitebit', ccxt.whitebit, {}),
+        '1': ('binance', ccxt_async.binance, {'options': {'defaultType': 'future'}}),
+        '2': ('binanceusdm', ccxt_async.binanceusdm, {}),
+        '3': ('okx', ccxt_async.okx, {'options': {'defaultType': 'swap'}}),
+        '4': ('bybit', ccxt_async.bybit, {'options': {'defaultType': 'linear'}}),
+        '5': ('bitget', ccxt_async.bitget, {'options': {'defaultType': 'swap'}}),
+        '6': ('whitebit', ccxt_async.whitebit, {}),
     }
 
     AVAILABLE_TFS = ['1m', '3m', '5m', '15m', '30m', '1h', '4h', '1d', '3d', '1w', '1M']
@@ -55,10 +54,9 @@ class CryptoScanner:
         self.ex_name, ex_class, ex_opts = self.EXCHANGES[ex_input]
         self.exchange = ex_class({'enableRateLimit': True, **ex_opts})
 
-        self.symbol = symbol_input if symbol_input else 'BTC/USDT:USDT'
-        if '/' not in self.symbol:
-            self.symbol = f"{self.symbol}/USDT" if self.ex_name == 'whitebit' else f"{self.symbol}/USDT:USDT"
-            
+        self.raw_symbol = symbol_input if symbol_input else 'BTC/USDT'
+        self.symbol = None 
+        
         timeframes = [tf.strip() for tf in tf_input.split(',')] if tf_input else ['15m', '1h', '4h']
         self.timeframes = [tf for tf in timeframes if tf in self.AVAILABLE_TFS] or ['15m', '1h', '4h']
 
@@ -71,14 +69,16 @@ class CryptoScanner:
         self.daily_vwap = None
         self.gen_err = None
 
-    def _retry_fetch(self, func, *args, retries=3, delay=1.5, **kwargs):
+    async def _retry_fetch(self, func, *args, retries=3, delay=1.5, **kwargs):
         for i in range(retries):
             try:
-                return func(*args, **kwargs)
-            except Exception as e:
+                return await func(*args, **kwargs)
+            except ccxt.NetworkError as e:
                 if i == retries - 1:
-                    raise e
-                time.sleep(delay)
+                    return e
+                await asyncio.sleep(delay)
+            except Exception as e:
+                return e 
         return None
 
     def cfg(self, tf):
@@ -91,9 +91,7 @@ class CryptoScanner:
     @staticmethod
     def get_session_context():
         now = datetime.now(timezone.utc)
-        h = now.hour
-        m = now.minute
-        time_val = h + m / 60.0
+        time_val = now.hour + now.minute / 60.0
 
         sessions = []
         if 0 <= time_val < 8: sessions.append("Asia")
@@ -105,8 +103,7 @@ class CryptoScanner:
     @staticmethod
     def find_pivots_vectorized(series: pd.Series, confirm: int, mode: str) -> pd.Series:
         window = confirm * 2 + 1
-        ref = series.rolling(window=window, center=True).max() if mode == 'high' \
-            else series.rolling(window=window, center=True).min()
+        ref = series.rolling(window=window, center=True).max() if mode == 'high' else series.rolling(window=window, center=True).min()
         return series == ref
 
     def market_structure(self, df: pd.DataFrame, tf: str) -> dict:
@@ -121,17 +118,16 @@ class CryptoScanner:
         recent['is_pl'] = self.find_pivots_vectorized(recent['low'], conf, 'low')
 
         last_idx = len(recent) - 1
+        
+        ph_mask = recent['is_ph']
+        pl_mask = recent['is_pl']
+        
         if max_age is not None:
-            ph_rows_chron = [(recent.at[i, 'high'], last_idx - i)
-                             for i in recent[recent['is_ph']].index if (last_idx - i) <= max_age]
-            pl_rows_chron = [(recent.at[i, 'low'], last_idx - i)
-                             for i in recent[recent['is_pl']].index if (last_idx - i) <= max_age]
-        else:
-            ph_rows_chron = [(recent.at[i, 'high'], last_idx - i) for i in recent[recent['is_ph']].index]
-            pl_rows_chron = [(recent.at[i, 'low'], last_idx - i) for i in recent[recent['is_pl']].index]
+            ph_mask = ph_mask & ((last_idx - recent.index) <= max_age)
+            pl_mask = pl_mask & ((last_idx - recent.index) <= max_age)
 
-        ph_vals = [v for v, _ in ph_rows_chron]
-        pl_vals = [v for v, _ in pl_rows_chron]
+        ph_vals = recent.loc[ph_mask, 'high'].tolist()
+        pl_vals = recent.loc[pl_mask, 'low'].tolist()
 
         hh = ("HH" if ph_vals[-1] > ph_vals[-2] else "LH") if len(ph_vals) >= 2 else "N/A"
         ll = ("HL" if pl_vals[-1] > pl_vals[-2] else "LL") if len(pl_vals) >= 2 else "N/A"
@@ -193,23 +189,20 @@ class CryptoScanner:
         c = self.cfg(tf)
         lookback = min(c['smc_lb'], len(df))
         min_gap = c['fvg_gap'] / 100.0
-        recent = df.tail(lookback).reset_index(drop=True)
+        recent = df.tail(lookback).copy()
         close = df.iloc[-1]['close']
-        bull_fvg, bear_fvg = [], []
-
-        for i in range(2, len(recent)):
-            h_i2, l_i2 = recent.at[i - 2, 'high'], recent.at[i - 2, 'low']
-            h_i, l_i = recent.at[i, 'high'], recent.at[i, 'low']
-
-            if l_i > h_i2:
-                gap = (l_i - h_i2) / h_i2
-                if gap >= min_gap and close > h_i2 and not (h_i2 <= close <= l_i):
-                    bull_fvg.append((round(h_i2, 4), round(l_i, 4)))
-
-            if h_i < l_i2:
-                gap = (l_i2 - h_i) / l_i2
-                if gap >= min_gap and close < l_i2 and not (h_i <= close <= l_i2):
-                    bear_fvg.append((round(h_i, 4), round(l_i2, 4)))
+        
+        recent['h_s2'] = recent['high'].shift(2)
+        recent['l_s2'] = recent['low'].shift(2)
+        
+        gap_bull = (recent['low'] - recent['h_s2']) / recent['h_s2']
+        gap_bear = (recent['l_s2'] - recent['high']) / recent['l_s2']
+        
+        bull_mask = (recent['low'] > recent['h_s2']) & (gap_bull >= min_gap) & (close > recent['h_s2']) & ~((recent['h_s2'] <= close) & (close <= recent['low']))
+        bear_mask = (recent['high'] < recent['l_s2']) & (gap_bear >= min_gap) & (close < recent['l_s2']) & ~((recent['high'] <= close) & (close <= recent['l_s2']))
+        
+        bull_fvg = list(zip(recent.loc[bull_mask, 'h_s2'].round(4), recent.loc[bull_mask, 'low'].round(4)))
+        bear_fvg = list(zip(recent.loc[bear_mask, 'high'].round(4), recent.loc[bear_mask, 'l_s2'].round(4)))
 
         return {
             'bullish': sorted(bull_fvg, key=lambda x: abs(close - x[0]))[:3],
@@ -224,16 +217,17 @@ class CryptoScanner:
         recent = df.tail(min(self.cfg(tf)['smc_lb'], len(df))).reset_index(drop=True)
         total = len(recent)
         trend, prev_sh, prev_sl = ms['trend'], ph[-2], pl[-2]
+        
+        mask_bull = (recent['close'].shift(1) <= prev_sh) & (recent['close'] > prev_sh)
+        mask_bear = (recent['close'].shift(1) >= prev_sl) & (recent['close'] < prev_sl)
+
         events = []
+        for idx in recent[mask_bull].index:
+            events.append({'type': 'CHoCH' if trend == 'BEARISH' else 'BOS', 'dir': 'BULLISH', 'level': round(prev_sh, 4), 'age': total - idx})
+        for idx in recent[mask_bear].index:
+            events.append({'type': 'CHoCH' if trend == 'BULLISH' else 'BOS', 'dir': 'BEARISH', 'level': round(prev_sl, 4), 'age': total - idx})
 
-        for i in range(1, total):
-            c, p = recent.at[i, 'close'], recent.at[i - 1, 'close']
-            age = total - i
-
-            if p <= prev_sh < c:
-                events.append({'type': 'CHoCH' if trend == 'BEARISH' else 'BOS', 'dir': 'BULLISH', 'level': round(prev_sh, 4), 'age': age})
-            if p >= prev_sl > c:
-                events.append({'type': 'CHoCH' if trend == 'BULLISH' else 'BOS', 'dir': 'BEARISH', 'level': round(prev_sl, 4), 'age': age})
+        events.sort(key=lambda x: x['age'], reverse=True)
 
         def tag(e):
             t = "FRESH" if e['age'] <= 5 else ("RECENT" if e['age'] <= 20 else "STALE")
@@ -241,6 +235,7 @@ class CryptoScanner:
 
         bos_ev = [e for e in events if e['type'] == 'BOS']
         choch_ev = [e for e in events if e['type'] == 'CHoCH']
+        
         return {
             'bos': [tag(e) for e in bos_ev[-2:]],
             'choch': [tag(e) for e in choch_ev[-2:]],
@@ -248,33 +243,40 @@ class CryptoScanner:
         }
 
     def calc_order_blocks(self, df: pd.DataFrame, ms: dict, tf: str) -> dict:
-        recent = df.tail(min(self.cfg(tf)['smc_lb'], len(df))).reset_index(drop=True)
-        avg_body = (recent['close'] - recent['open']).abs().rolling(20).mean()
+        recent = df.tail(min(self.cfg(tf)['smc_lb'], len(df))).copy()
+        body = (recent['close'] - recent['open']).abs()
+        avg_b = body.rolling(20).mean()
         prev_sh, prev_sl = ms['prev_sh'], ms['prev_sl']
-        bull_obs, bear_obs = [], []
+        
+        is_bear = recent['close'] < recent['open']
+        is_bull = recent['close'] > recent['open']
+        
+        bear_top = recent[['open', 'close']].max(axis=1).where(is_bear).ffill().shift(1)
+        bear_bot = recent[['open', 'close']].min(axis=1).where(is_bear).ffill().shift(1)
+        
+        bull_top = recent[['open', 'close']].max(axis=1).where(is_bull).ffill().shift(1)
+        bull_bot = recent[['open', 'close']].min(axis=1).where(is_bull).ffill().shift(1)
+        
+        bull_cond = is_bull & (body > self.ob_impulse_mult * avg_b)
+        if prev_sh is not None: bull_cond &= (recent['close'] > prev_sh)
+        else: bull_cond &= False
 
-        for i in range(2, len(recent) - 1):
-            body = abs(recent.at[i, 'close'] - recent.at[i, 'open'])
-            avg_b = avg_body.at[i] if pd.notna(avg_body.at[i]) else 0
+        bear_cond = is_bear & (body > self.ob_impulse_mult * avg_b)
+        if prev_sl is not None: bear_cond &= (recent['close'] < prev_sl)
+        else: bear_cond &= False
 
-            if recent.at[i, 'close'] > recent.at[i, 'open'] and prev_sh and recent.at[i, 'close'] > prev_sh and body > self.ob_impulse_mult * avg_b:
-                for j in range(i - 1, max(i - 10, 0), -1):
-                    if recent.at[j, 'close'] < recent.at[j, 'open']:
-                        bull_obs.append({'bot': round(min(recent.at[j, 'open'], recent.at[j, 'close']), 4), 'top': round(max(recent.at[j, 'open'], recent.at[j, 'close']), 4)})
-                        break
+        bull_obs_raw = zip(bear_bot[bull_cond], bear_top[bull_cond])
+        bear_obs_raw = zip(bull_bot[bear_cond], bull_top[bear_cond])
 
-            if recent.at[i, 'close'] < recent.at[i, 'open'] and prev_sl and recent.at[i, 'close'] < prev_sl and body > self.ob_impulse_mult * avg_b:
-                for j in range(i - 1, max(i - 10, 0), -1):
-                    if recent.at[j, 'close'] > recent.at[j, 'open']:
-                        bear_obs.append({'bot': round(min(recent.at[j, 'open'], recent.at[j, 'close']), 4), 'top': round(max(recent.at[j, 'open'], recent.at[j, 'close']), 4)})
-                        break
+        bull_obs = [{'bot': round(b, 4), 'top': round(t, 4)} for b, t in bull_obs_raw if pd.notna(b)]
+        bear_obs = [{'bot': round(b, 4), 'top': round(t, 4)} for b, t in bear_obs_raw if pd.notna(b)]
 
         def dedup(lst):
             seen, out = set(), []
             for ob in lst:
-                key = (ob['bot'], ob['top'])
-                if key not in seen:
-                    seen.add(key); out.append(ob)
+                if (ob['bot'], ob['top']) not in seen:
+                    seen.add((ob['bot'], ob['top']))
+                    out.append(ob)
             return out
 
         return {'bullish': dedup(bull_obs)[-3:], 'bearish': dedup(bear_obs)[-3:]}
@@ -298,10 +300,10 @@ class CryptoScanner:
             np.fill_diagonal(diffs_h, np.inf)
             i_idx, j_idx = np.where((diffs_h <= c['eq_thresh']) & (np.tri(len(highs), k=-1) == 0))
             seen_h = set()
-            for idx in range(len(i_idx)):
-                level = round((highs[i_idx[idx]] + highs[j_idx[idx]]) / 2, 4)
+            for i, j in zip(i_idx, j_idx):
+                level = round((highs[i] + highs[j]) / 2, 4)
                 if level > close and level not in seen_h:
-                    eq_highs.append({'level': level, 'diff': round(diffs_h[i_idx[idx], j_idx[idx]], 3)})
+                    eq_highs.append({'level': level, 'diff': round(diffs_h[i, j], 3)})
                     seen_h.add(level)
 
         if len(lows) > 1:
@@ -309,10 +311,10 @@ class CryptoScanner:
             np.fill_diagonal(diffs_l, np.inf)
             i_idx_l, j_idx_l = np.where((diffs_l <= c['eq_thresh']) & (np.tri(len(lows), k=-1) == 0))
             seen_l = set()
-            for idx in range(len(i_idx_l)):
-                level = round((lows[i_idx_l[idx]] + lows[j_idx_l[idx]]) / 2, 4)
+            for i, j in zip(i_idx_l, j_idx_l):
+                level = round((lows[i] + lows[j]) / 2, 4)
                 if level < close and level not in seen_l:
-                    eq_lows.append({'level': level, 'diff': round(diffs_l[i_idx_l[idx], j_idx_l[idx]], 3)})
+                    eq_lows.append({'level': level, 'diff': round(diffs_l[i, j], 3)})
                     seen_l.add(level)
 
         return {
@@ -320,65 +322,77 @@ class CryptoScanner:
             'equal_lows': sorted(eq_lows, key=lambda x: x['level'], reverse=True)[:3],
         }
 
-    def calc_premium_discount(self, df: pd.DataFrame, ms: dict, tf: str) -> dict:
-        sh, sl = (float(df.tail(self.cfg(tf)['pivot_n'])['high'].max()), float(df.tail(self.cfg(tf)['pivot_n'])['low'].min())) if tf in {'1m','3m','5m'} else (ms['swing_high'], ms['swing_low'])
-        if not sh or not sl or sh <= sl: return {'zone': 'N/A', 'eq': None, 'premium_min': None, 'discount_max': None, 'sh': sh, 'sl': sl}
+    def calc_premium_discount(self, df: pd.DataFrame, ms: dict) -> dict:
+        sh, sl = ms['swing_high'], ms['swing_low']
+        if not sh or not sl or sh <= sl: 
+            return {'zone': 'N/A', 'eq': None, 'premium_min': None, 'discount_max': None, 'sh': sh, 'sl': sl}
+        
         close = df.iloc[-1]['close']
         rng = sh - sl
         eq, prem_min, disc_max = round(sl + rng * 0.5, 4), round(sl + rng * 0.75, 4), round(sl + rng * 0.25, 4)
         pct = round((close - sl) / rng * 100, 1)
+        
         if pct > 100: zone = f"ABOVE RANGE ({pct}%)"
         elif pct < 0: zone = f"BELOW RANGE ({pct}%)"
         else: zone = f"PREMIUM ({pct}%)" if pct >= 75 else f"DISCOUNT ({pct}%)" if pct <= 25 else f"EQ {'UPPER' if pct>=50 else 'LOWER'} ({pct}%)"
+        
         return {'zone': zone, 'eq': eq, 'premium_min': prem_min, 'discount_max': disc_max, 'sh': sh, 'sl': sl}
 
     def calc_fta(self, df: pd.DataFrame, ms: dict, fvg: dict, obs: dict) -> dict:
         close = df.iloc[-1]['close']
         res, sup = [], []
         if ms['swing_high'] and ms['swing_high'] > close: res.append(('Swing High', ms['swing_high']))
-        for b, t in fvg.get('bearish', []):
+        for _, t in fvg.get('bearish', []):
             if t > close: res.append(('Bear FVG', t))
         for ob in obs.get('bearish', []):
             if ob['top'] > close: res.append(('Bear OB', ob['top']))
         if ms['swing_low'] and ms['swing_low'] < close: sup.append(('Swing Low', ms['swing_low']))
-        for b, t in fvg.get('bullish', []):
+        for b, _ in fvg.get('bullish', []):
             if b < close: sup.append(('Bull FVG', b))
         for ob in obs.get('bullish', []):
             if ob['bot'] < close: sup.append(('Bull OB', ob['bot']))
+            
         return {'resistance': min(res, key=lambda x: x[1]) if res else None, 'support': max(sup, key=lambda x: x[1]) if sup else None}
 
-    def fetch_daily_vwap(self):
+    async def fetch_daily_vwap(self):
         try:
             start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             since, end = int(start.timestamp() * 1000), int(datetime.now(timezone.utc).timestamp() * 1000)
             rows, cur = [], since
             while cur < end:
-                batch = self._retry_fetch(self.exchange.fetch_ohlcv, self.symbol, '1m', since=cur, limit=500)
-                if not batch: break
+                batch = await self._retry_fetch(self.exchange.fetch_ohlcv, self.symbol, '1m', since=cur, limit=500)
+                if isinstance(batch, Exception) or not batch: break
                 rows.extend(batch)
                 if batch[-1][0] >= end or len(batch) < 500: break
                 cur = batch[-1][0] + 60_000
             if rows:
                 d = pd.DataFrame(rows, columns=['ts', 'o', 'h', 'l', 'c', 'v'])
                 self.daily_vwap = round(float(((d['h'] + d['l'] + d['c']) / 3 * d['v']).sum() / d['v'].sum()), 4)
-        except Exception: self.daily_vwap = None
+        except Exception:
+            self.daily_vwap = None
 
-    def fetch_tf(self, tf):
-        try: self.results[tf] = self._retry_fetch(self.exchange.fetch_ohlcv, self.symbol, tf, limit=self.limit_candles)
-        except Exception as e: self.results[tf] = e
+    async def fetch_tf(self, tf):
+        res = await self._retry_fetch(self.exchange.fetch_ohlcv, self.symbol, tf, limit=self.limit_candles)
+        self.results[tf] = res
 
-    def fetch_general(self):
+    async def fetch_general(self):
         try:
-            t = self._retry_fetch(self.exchange.fetch_ticker, self.symbol)
-            fr, oi, ob, ob_err = None, None, None, None
-            try: fr = self._retry_fetch(self.exchange.fetch_funding_rate, self.symbol, retries=2)
-            except Exception: pass
-            try: oi = self._retry_fetch(self.exchange.fetch_open_interest, self.symbol, retries=2)
-            except Exception: pass
-            try: ob = self._retry_fetch(self.exchange.fetch_order_book, self.symbol, limit=100, retries=2)
-            except Exception as e: ob_err = str(e)
-            self.gen_data = {'ticker': t, 'fr': fr, 'oi': oi, 'ob': ob, 'ob_err': ob_err}
-        except Exception as e: self.gen_err = e
+            t = await self._retry_fetch(self.exchange.fetch_ticker, self.symbol)
+            if isinstance(t, Exception): raise t
+            
+            fr = await self._retry_fetch(self.exchange.fetch_funding_rate, self.symbol, retries=2)
+            oi = await self._retry_fetch(self.exchange.fetch_open_interest, self.symbol, retries=2)
+            ob = await self._retry_fetch(self.exchange.fetch_order_book, self.symbol, limit=100, retries=2)
+            
+            self.gen_data = {
+                'ticker': t, 
+                'fr': fr if not isinstance(fr, Exception) else None, 
+                'oi': oi if not isinstance(oi, Exception) else None, 
+                'ob': ob if not isinstance(ob, Exception) else None, 
+                'ob_err': str(ob) if isinstance(ob, Exception) else None
+            }
+        except Exception as e: 
+            self.gen_err = e
 
     def calc_orderbook_metrics(self, ob, price):
         if not ob or not ob.get('bids') or not ob.get('asks'): return None
@@ -388,7 +402,6 @@ class CryptoScanner:
         ask_vol_2pct = sum(v for p, v in asks if p <= best_ask * 1.02)
         total_vol = bid_vol_2pct + ask_vol_2pct
         
-        # Median filtering for real walls
         bid_vols_5 = [x[1] for x in bids if x[0] >= best_bid * 0.95]
         ask_vols_5 = [x[1] for x in asks if x[0] <= best_ask * 1.05]
         med_b, med_a = np.median(bid_vols_5) if bid_vols_5 else 0, np.median(ask_vols_5) if ask_vols_5 else 0
@@ -409,27 +422,57 @@ class CryptoScanner:
         key_lows = list(ms['all_lows'][:5]) + [eq['level'] for eq in eql.get('equal_lows', [])]
         recent_n = 15
         if len(df) < recent_n: return sweeps
-        for i in range(len(df) - recent_n, len(df)):
-            candle = df.iloc[i]
-            c_h, c_l, c_c, age = candle['high'], candle['low'], candle['close'], (len(df) - 1) - i
+        
+        recent = df.tail(recent_n)
+        for idx, candle in recent.iterrows():
+            c_h, c_l, c_c, age = candle['high'], candle['low'], candle['close'], (len(df) - 1) - idx
             for kh in key_highs:
                 if c_h > kh and c_c < kh and (c_h - kh) / kh > 0.0005: sweeps.append({'dir': 'Bearish', 'level': kh, 'age': age})
             for kl in key_lows:
                 if c_l < kl and c_c > kl and (kl - c_l) / kl > 0.0005: sweeps.append({'dir': 'Bullish', 'level': kl, 'age': age})
+                
         return sorted(list({f"{s['dir']}_{s['level']}": s for s in sweeps}.values()), key=lambda x: x['age'])[:5]
 
+    async def _async_run(self):
+        try:
+            await self.exchange.load_markets()
+            
+            # Robust Symbol Validation
+            possible_symbols = [
+                self.raw_symbol,
+                f"{self.raw_symbol}/USDT",
+                f"{self.raw_symbol}/USDT:USDT",
+                f"{self.raw_symbol}/USDC:USDC",
+                f"{self.raw_symbol}USDT"
+            ]
+            
+            for sym in possible_symbols:
+                if sym in self.exchange.markets:
+                    self.symbol = sym
+                    break
+                    
+            if not self.symbol:
+                return f"Error: Symbol {self.raw_symbol} not found on {self.ex_name}."
+
+            print(f"\nFetching data concurrently for {self.symbol}...")
+            
+            tasks = [self.fetch_general(), self.fetch_daily_vwap()]
+            tasks.extend([self.fetch_tf(tf) for tf in self.timeframes])
+            
+            await asyncio.gather(*tasks)
+            return self.generate_report()
+            
+        finally:
+            await self.exchange.close()
+
     def run(self):
-        print("\nFetching data concurrently...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(4, len(self.timeframes)+2)) as executor:
-            futures = [executor.submit(self.fetch_general), executor.submit(self.fetch_daily_vwap)]
-            for tf in self.timeframes: futures.append(executor.submit(self.fetch_tf, tf))
-            concurrent.futures.wait(futures)
-        return self.generate_report()
+        return asyncio.run(self._async_run())
 
     def generate_report(self):
+        if not self.symbol: return "Init failed."
         ticker, fr_data, oi_data = self.gen_data.get('ticker', {}), self.gen_data.get('fr', {}), self.gen_data.get('oi', {})
         ob, ob_err = self.gen_data.get('ob'), self.gen_data.get('ob_err')
-        price = ticker.get('last', 0.0)
+        price = ticker.get('last', 0.0) if ticker else 0.0
         session_ctx = self.get_session_context()
 
         ob_str = "--- ORDERBOOK & SCALPING INFO ---\n"
@@ -442,11 +485,11 @@ class CryptoScanner:
         else: ob_str += "Orderbook N/A\n\n"
 
         fr, fr_bias = (fr_data['fundingRate'] * 100, "BEARISH (longs->shorts)" if fr_data['fundingRate'] > 0.0005 else "BULLISH (shorts->longs)" if fr_data['fundingRate'] < -0.0005 else "NEUTRAL") if fr_data and 'fundingRate' in fr_data else (0.0, "N/A")
-        oi_line = f"OI: {oi_data['openInterestAmount']:.2f} {self.symbol.split('/')[0]} (${oi_data['openInterestAmount'] * price:,.0f})\n" if oi_data and 'openInterestAmount' in oi_data else ""
+        oi_line = f"OI: {oi_data['openInterestAmount']:.2f} (${oi_data['openInterestAmount'] * price:,.0f})\n" if oi_data and 'openInterestAmount' in oi_data else ""
 
         hdr = f"EXCHANGE: {self.ex_name}\n" + (f"WARNING: General data fetch failed: {self.gen_err}\n" if self.gen_err else "")
-        hdr += f"PAIR: {self.symbol} | PRICE: {price:.4f} USDT | SESSION: {session_ctx}\n"
-        hdr += f"24h Vol: {ticker.get('baseVolume',0):,.2f} {self.symbol.split('/')[0]} (${ticker.get('quoteVolume',0):,.0f})\n"
+        hdr += f"PAIR: {self.symbol} | PRICE: {price:.4f} | SESSION: {session_ctx}\n"
+        hdr += f"24h Vol: {ticker.get('baseVolume',0):,.2f} (${ticker.get('quoteVolume',0):,.0f})\n" if ticker else ""
         hdr += f"Funding: {fr:.4f}% -> {fr_bias}\n{oi_line}"
         hdr += f"Daily VWAP: {self.daily_vwap if self.daily_vwap else 'N/A'}\n"
         hdr += f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n{ob_str}"
@@ -457,17 +500,17 @@ class CryptoScanner:
         raw = self.results.get(tf)
         if isinstance(raw, Exception): return tf_info + f"Error {tf}: {raw}\n\n"
         if not raw or len(raw) < self.min_candles: return tf_info + f"[TF:{tf}] Not enough candles. Skipped.\n\n"
+        
         df = pd.DataFrame(raw, columns=['timestamp','open','high','low','close','volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-        df['time'] = df['timestamp'].dt.strftime('%Y-%m-%d %H:%M')
         
-        # Indicators
         df['RSI'] = ta.rsi(df['close'], length=14)
         df['ATR'] = ta.atr(df['high'], df['low'], df['close'], length=14)
         df['EMA9'], df['EMA21'] = ta.ema(df['close'], length=9), ta.ema(df['close'], length=21)
         df['EMA50'], df['EMA200'] = ta.ema(df['close'], length=50), ta.ema(df['close'], length=200)
         df['VolumeMA'] = ta.sma(df['volume'], length=20)
         df['ROC5'] = df['close'].pct_change(5) * 100
+        
         macd = ta.macd(df['close'])
         if macd is not None: df['MACD'], df['MACD_S'], df['MACD_H'] = macd.iloc[:,0], macd.iloc[:,2], macd.iloc[:,1]
         stoch = ta.stoch(df['high'], df['low'], df['close'])
@@ -480,7 +523,7 @@ class CryptoScanner:
         fibs = self.calc_fib_retest(df, ms)
         fvg, bos, obs = self.calc_fvg(df, tf), self.calc_bos_choch(df, ms, tf), self.calc_order_blocks(df, ms, tf)
         bbk, eql, fta = self.calc_breaker_blocks(df, obs), self.calc_equal_hl(df, tf), self.calc_fta(df, ms, fvg, obs)
-        prem, sweeps = self.calc_premium_discount(df, ms, tf), self.calc_liquidity_sweeps(df, ms, eql)
+        prem, sweeps = self.calc_premium_discount(df, ms), self.calc_liquidity_sweeps(df, ms, eql)
         
         vol_r = last['volume'] / last['VolumeMA'] if pd.notna(last.get('VolumeMA')) and last['VolumeMA']>0 else 0
         inc = (datetime.now(timezone.utc) - last['timestamp'].to_pydatetime()).total_seconds() < self.TF_SECONDS.get(tf, 900)
@@ -520,10 +563,13 @@ class CryptoScanner:
         return info
 
 def main():
-    print("=" * 65 + "\n  Crypto Scanner v14 Ultimate | Professional SMC Edition\n" + "=" * 65)
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        
+    print("=" * 65 + "\n  Crypto Scanner v15 Async | Extreme Performance Edition\n" + "=" * 65)
     for k, (name, _, _) in CryptoScanner.EXCHANGES.items(): print(f"  {k}. {name}")
     ex_in = input("\nExchange (default 2): ").strip()
-    sym_in = input("Pair (e.g. ETH): ").strip().upper()
+    sym_in = input("Pair (e.g. BTC): ").strip().upper()
     tf_in = input("TFs (e.g. 15m,1h,4h): ").strip()
 
     scanner = CryptoScanner(ex_in, sym_in, tf_in)
