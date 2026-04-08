@@ -55,7 +55,19 @@ class CryptoScanner:
         self.ex_name, self.ex_class, self.ex_opts = self.EXCHANGES[ex_input]
         
         # Check for Proxy in Environment (Critical for Render.com / Restricted Regions)
-        proxy_url = os.getenv('PROXY_URL') or os.getenv('HTTPS_PROXY') or os.getenv('HTTP_PROXY')
+        raw_proxy = os.getenv('PROXY_URL') or os.getenv('HTTPS_PROXY') or os.getenv('HTTP_PROXY')
+        
+        def format_proxy(url):
+            if not url: return None
+            url = url.strip()
+            if url.startswith('http'): return url
+            # Common raw format host:port:user:pass
+            parts = url.split(':')
+            if len(parts) == 4:
+                return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+            return url # Fallback
+
+        proxy_url = format_proxy(raw_proxy)
         self.proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
         
         self.exchange = self.ex_class({'enableRateLimit': True, 'proxies': self.proxies, **self.ex_opts})
@@ -445,15 +457,20 @@ class CryptoScanner:
 
     def run(self):
         try:
+            # Check Proxy Status first
+            if self.proxies:
+                p_url = next(iter(self.proxies.values()))
+                # Mask password for security
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] NETWORK: Using proxy {p_url.split('@')[-1]}")
+            else:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] NETWORK: No Proxy set. Direct connection (may fail on Render).")
+
             # Initialize exchange here for Proxy and RateLimit safety
             self.exchange = self.ex_class({
                 'enableRateLimit': True, 
                 'proxies': self.proxies,
                 **self.ex_opts
             })
-            
-            if self.proxies:
-                print(f"DEBUG: Using proxy: {next(iter(self.proxies.values()))}")
             
             self.exchange.load_markets()
             
@@ -492,7 +509,6 @@ class CryptoScanner:
                     elif key == 'vwap':
                         self.daily_vwap = res
                     else:
-                        # Fetcher returned (tf, data)
                         tf_name, tf_data = res
                         self.results[tf_name] = tf_data
                 
