@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import pandas_ta as ta
 import subprocess
 import sys
+import os
 import concurrent.futures
 import time
 
@@ -51,8 +52,13 @@ class CryptoScanner:
 
     def __init__(self, ex_input, symbol_input, tf_input):
         ex_input = ex_input if ex_input in self.EXCHANGES else '2'
-        self.ex_name, ex_class, ex_opts = self.EXCHANGES[ex_input]
-        self.exchange = ex_class({'enableRateLimit': True, **ex_opts})
+        self.ex_name, self.ex_class, self.ex_opts = self.EXCHANGES[ex_input]
+        
+        # Check for Proxy in Environment (Critical for Render.com / Restricted Regions)
+        proxy_url = os.getenv('PROXY_URL') or os.getenv('HTTPS_PROXY') or os.getenv('HTTP_PROXY')
+        self.proxies = {'http': proxy_url, 'https': proxy_url} if proxy_url else None
+        
+        self.exchange = self.ex_class({'enableRateLimit': True, 'proxies': self.proxies, **self.ex_opts})
 
         self.raw_symbol = symbol_input if symbol_input else 'BTC'
         self.symbol = None 
@@ -439,6 +445,16 @@ class CryptoScanner:
 
     def run(self):
         try:
+            # Initialize exchange here for Proxy and RateLimit safety
+            self.exchange = self.ex_class({
+                'enableRateLimit': True, 
+                'proxies': self.proxies,
+                **self.ex_opts
+            })
+            
+            if self.proxies:
+                print(f"DEBUG: Using proxy: {next(iter(self.proxies.values()))}")
+            
             self.exchange.load_markets()
             
             possible_symbols = [
