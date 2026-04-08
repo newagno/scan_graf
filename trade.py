@@ -460,8 +460,17 @@ class CryptoScanner:
             # Check Proxy Status first
             if self.proxies:
                 p_url = next(iter(self.proxies.values()))
-                # Mask password for security
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] NETWORK: Using proxy {p_url.split('@')[-1]}")
+                
+                # HEARTBEAT TEST: Check if proxy works at all (using ccxt internal request)
+                try:
+                    import requests
+                    # Try to get public IP through the proxy
+                    resp = requests.get('https://api.ipify.org?format=json', proxies=self.proxies, timeout=10, verify=False)
+                    ext_ip = resp.json().get('ip', 'Unknown')
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] NETWORK: Proxy Test SUCCESS. IP through proxy is {ext_ip}")
+                except Exception as p_err:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] NETWORK: Proxy Test FAILED. Error: {p_err}")
             else:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] NETWORK: No Proxy set. Direct connection (may fail on Render).")
 
@@ -469,6 +478,7 @@ class CryptoScanner:
             self.exchange = self.ex_class({
                 'enableRateLimit': True, 
                 'proxies': self.proxies,
+                'verify': False, # Critical: Bypass SSL cert chain issues on cloud proxies
                 **self.ex_opts
             })
             
